@@ -6,8 +6,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Patch base-image OS packages (Trivy gates on fixed HIGH/CRITICAL CVEs).
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir --upgrade setuptools urllib3 \
+    && pip uninstall -y virtualenv \
     && python -m playwright install chromium
 
 COPY pricetracker ./pricetracker

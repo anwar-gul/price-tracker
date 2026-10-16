@@ -1,0 +1,9 @@
+# Trivy ignore list. Every entry needs a justification and an expiry review.
+
+# Dependencies vendored inside pip itself (pip/_vendor, e.g. via pip/_vendor/vendor.txt).
+# They are pip-internal (not importable by pricetracker) and are refreshed when pip
+# is upgraded -- the Docker build upgrades pip to the latest release on every build.
+CVE-2025-47273
+CVE-2026-97687
+CVE-2026-97689
+GHSA-6v7p-g79w-8964
