@@ -75,3 +75,23 @@ jobs:
         run: |
           docker run --rm pricetracker:ci init-db
           docker run --rm pricetracker:ci status
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: pricetracker:scan
+      - name: Trivy image scan (HIGH/CRITICAL, fixed only)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: pricetracker:scan
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true

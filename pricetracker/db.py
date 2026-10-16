@@ -19,6 +19,7 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    or_,
     select,
     update,
 )
@@ -69,9 +70,15 @@ alerts = Table(
     Column("title", Text),
     Column("detail", Text),
     Column("status", String(16), nullable=False),
+    Column("channel", String(16), nullable=False, default="log"),
+    Column("payload", Text),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("next_attempt_at", String(40)),
+    Column("last_error", Text),
     Column("sent_at", String(40), nullable=False),
 )
 Index("idx_alerts_url_kind", alerts.c.url, alerts.c.kind, alerts.c.sent_at)
+Index("idx_alerts_status", alerts.c.status, alerts.c.next_attempt_at)
 
 runs = Table(
     "runs",
@@ -293,14 +300,85 @@ def latest_successful_run(conn: Connection, before_id: int | None = None):
 
 
 def record_alert(
-    conn: Connection, url: str, kind: str, title: str, detail: str, status: str
-) -> None:
-    conn.execute(
+    conn: Connection,
+    url: str,
+    kind: str,
+    title: str,
+    detail: str,
+    status: str,
+    *,
+    channel: str = "log",
+    payload: str | None = None,
+    attempts: int = 0,
+    next_attempt_at: str | None = None,
+    last_error: str | None = None,
+) -> int:
+    result = conn.execute(
         insert(alerts).values(
-            url=url, kind=kind, title=title, detail=detail, status=status, sent_at=now_iso()
+            url=url,
+            kind=kind,
+            title=title,
+            detail=detail,
+            status=status,
+            channel=channel,
+            payload=payload,
+            attempts=attempts,
+            next_attempt_at=next_attempt_at,
+            last_error=last_error,
+            sent_at=now_iso(),
         )
     )
     conn.commit()
+    return result.inserted_primary_key[0]
+
+
+def fetch_due_alerts(
+    conn: Connection, limit: int = 20, max_attempts: int = 5
+) -> list:
+    """Failed alerts whose retry backoff has elapsed, oldest first."""
+    now = now_iso()
+    rows = conn.execute(
+        select(alerts)
+        .where(
+            alerts.c.status == "failed",
+            alerts.c.channel.in_(("webhook", "email")),
+            alerts.c.attempts < max_attempts,
+            or_(alerts.c.next_attempt_at.is_(None), alerts.c.next_attempt_at <= now),
+        )
+        .order_by(alerts.c.id)
+        .limit(limit)
+    ).mappings().all()
+    return list(rows)
+
+
+def update_alert_attempt(
+    conn: Connection,
+    alert_id: int,
+    *,
+    status: str,
+    attempts: int,
+    next_attempt_at: str | None = None,
+    last_error: str | None = None,
+) -> None:
+    conn.execute(
+        update(alerts)
+        .where(alerts.c.id == alert_id)
+        .values(
+            status=status,
+            attempts=attempts,
+            next_attempt_at=next_attempt_at,
+            last_error=last_error,
+            sent_at=now_iso(),
+        )
+    )
+    conn.commit()
+
+
+def alert_counts(conn: Connection) -> dict[str, int]:
+    rows = conn.execute(
+        select(alerts.c.status, func.count()).group_by(alerts.c.status)
+    ).all()
+    return {status: count for status, count in rows}
 
 
 ALERT_COOLDOWN_STATUSES = ("sent", "failed")

@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     webhook_backoff_seconds: float = 1.0
     alert_cooldown_hours: float = 24.0
     alert_on_zero_items: bool = True
+    alert_max_attempts: int = 5
+    alert_retry_base_seconds: int = 60
 
     smtp_host: str | None = _aliased("SMTP_HOST")
     smtp_port: int = Field(
@@ -71,6 +73,8 @@ class Settings(BaseSettings):
 
     # --- ops ---
     metrics_port: int = 0
+    prune_keep_days: int = 90
+    prune_every_hours: float = 24.0
 
     @field_validator("log_level")
     @classmethod
@@ -107,11 +111,19 @@ class Settings(BaseSettings):
             raise ValueError("webhook_url must be http(s)")
         return value
 
-    @field_validator("alert_cooldown_hours", "webhook_backoff_seconds", "webhook_timeout_seconds")
+    @field_validator("alert_cooldown_hours", "webhook_backoff_seconds", "webhook_timeout_seconds",
+                     "prune_every_hours")
     @classmethod
     def _non_negative(cls, value: float) -> float:
         if value < 0:
             raise ValueError("must be >= 0")
+        return value
+
+    @field_validator("alert_max_attempts", "prune_keep_days")
+    @classmethod
+    def _positive_int(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("must be >= 1")
         return value
 
     @property

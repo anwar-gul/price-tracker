@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.63.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59532aaa6210e21014d07093120dc25528870c0b840da1f0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install chromium
 
 COPY pricetracker ./pricetracker
-COPY scrapy.cfg .
+COPY migrations ./migrations
+COPY alembic.ini scrapy.cfg ./
 
 RUN mkdir -p /app/data /app/exports \
     && chown -R pwuser:pwuser /app

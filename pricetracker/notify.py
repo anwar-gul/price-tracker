@@ -78,25 +78,75 @@ def _send_email(settings: Settings, subject: str, body: str) -> bool:
     return False
 
 
-def _deliver(message: str, details: dict, settings: Settings, subject: str) -> str:
+def _deliver(
+    message: str, details: dict, settings: Settings, subject: str
+) -> tuple[str, str | None, str | None]:
     """Push one alert through the configured remote channels.
 
-    Returns the alert status: sent | failed | logged (no remote channels).
+    Returns (status, retry_channel, error): status is sent | failed | logged;
+    retry_channel names the channel to retry when delivery failed.
     """
     if not (settings.webhook_configured or settings.email_configured):
         metrics.record_alert("log", "sent")
-        return "logged"
+        return "logged", None, None
 
     delivered = False
+    failed: list[str] = []
     if settings.webhook_configured:
         ok = _post_webhook(settings.webhook_url, message, details, settings)
         metrics.record_alert("webhook", "sent" if ok else "failed")
         delivered = delivered or ok
+        if not ok:
+            failed.append("webhook")
     if settings.email_configured:
         ok = _send_email(settings, subject, message)
         metrics.record_alert("email", "sent" if ok else "failed")
         delivered = delivered or ok
-    return "sent" if delivered else "failed"
+        if not ok:
+            failed.append("email")
+    if delivered:
+        return "sent", None, None
+    return "failed", failed[0], f"{failed[0]} delivery failed"
+
+
+def _backoff_seconds(attempts: int, base: int) -> float:
+    return base * (2 ** max(0, attempts - 1))
+
+
+def _next_attempt_iso(attempts: int, settings: Settings) -> str:
+    due = datetime.now(UTC) + timedelta(
+        seconds=_backoff_seconds(attempts, settings.alert_retry_base_seconds)
+    )
+    return due.isoformat(timespec="seconds")
+
+
+def _record_delivery(
+    conn,
+    update: PriceUpdate,
+    message: str,
+    details: dict,
+    settings: Settings,
+    subject: str,
+) -> str:
+    status, channel, error = _deliver(message, details, settings, subject)
+    record = {
+        "channel": channel or "log",
+        "attempts": 0,
+        "payload": None,
+        "next_attempt_at": None,
+        "last_error": None,
+    }
+    if status in ("sent", "failed"):
+        record.update(
+            attempts=1,
+            payload=json.dumps({"message": message, **details}),
+            next_attempt_at=_next_attempt_iso(1, settings) if status == "failed" else None,
+            last_error=error,
+        )
+    db.record_alert(
+        conn, update.url, "drop", update.title, message, status, **record
+    )
+    return status
 
 
 def _in_cooldown(conn, url: str, kind: str, settings: Settings) -> bool:
@@ -137,8 +187,10 @@ def notify_drops(conn, updates: list[PriceUpdate], settings: Settings, logger=No
             db.record_alert(conn, update.url, "drop", update.title, message, "suppressed")
             counts["suppressed"] += 1
             continue
-        status = _deliver(message, details, settings, f"[price-tracker] price drop: {update.title}")
-        db.record_alert(conn, update.url, "drop", update.title, message, status)
+        status = _record_delivery(
+            conn, update, message, details, settings,
+            f"[price-tracker] price drop: {update.title}",
+        )
         counts[status] += 1
 
     if logger and (settings.webhook_configured or settings.email_configured):
@@ -165,8 +217,70 @@ def notify_zero_items(
         fh.write(f"{_now()} {message}\n")
 
     details = {"event": "zero_items", "spider": spider, "previous_items": previous_items, "at": _now()}
-    status = _deliver(message, details, settings, f"[price-tracker] zero items from {spider}")
-    db.record_alert(conn, f"spider:{spider}", "zero_items", spider, message, status)
+    status, channel, error = _deliver(
+        message, details, settings, f"[price-tracker] zero items from {spider}"
+    )
+    db.record_alert(
+        conn, f"spider:{spider}", "zero_items", spider, message, status,
+        channel=channel or "log",
+        payload=json.dumps({"message": message, **details}) if status in ("sent", "failed") else None,
+        attempts=1 if status in ("sent", "failed") else 0,
+        next_attempt_at=_next_attempt_iso(1, settings) if status == "failed" else None,
+        last_error=error,
+    )
     if logger:
         logger.warning(message)
     return status
+
+
+def retry_due(conn, settings: Settings, limit: int = 20, logger=None) -> dict[str, int]:
+    """Re-attempt failed alerts due for retry (outbox pattern).
+
+    Sends on the recorded channel, backs off exponentially, and marks alerts
+    'dead' once alert_max_attempts is exhausted.
+    """
+    counts = {"retried": 0, "sent": 0, "failed": 0, "dead": 0}
+    rows = db.fetch_due_alerts(conn, limit=limit, max_attempts=settings.alert_max_attempts)
+    for row in rows:
+        counts["retried"] += 1
+        attempts = row["attempts"] + 1
+        channel = row["channel"]
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+        message = payload.pop("message", row["detail"] or "")
+        subject = f"[price-tracker] retry: {row['title'] or row['kind']}"
+
+        if channel == "webhook" and settings.webhook_configured:
+            ok = _post_webhook(settings.webhook_url, message, payload, settings)
+        elif channel == "email" and settings.email_configured:
+            ok = _send_email(settings, subject, message)
+        else:
+            ok = False
+
+        if ok:
+            metrics.record_alert(channel, "retry_sent")
+            db.update_alert_attempt(
+                conn, row["id"], status="sent", attempts=attempts, next_attempt_at=None
+            )
+            counts["sent"] += 1
+        elif attempts >= settings.alert_max_attempts:
+            metrics.record_alert(channel, "dead")
+            db.update_alert_attempt(
+                conn, row["id"], status="dead", attempts=attempts,
+                next_attempt_at=None, last_error="max attempts reached",
+            )
+            counts["dead"] += 1
+        else:
+            metrics.record_alert(channel, "retry_failed")
+            db.update_alert_attempt(
+                conn, row["id"], status="failed", attempts=attempts,
+                next_attempt_at=_next_attempt_iso(attempts, settings),
+                last_error="retry failed",
+            )
+            counts["failed"] += 1
+
+    if logger and counts["retried"]:
+        logger.info(
+            f"Alert retry: {counts['retried']} due, {counts['sent']} sent, "
+            f"{counts['failed']} still failing, {counts['dead']} dead"
+        )
+    return counts

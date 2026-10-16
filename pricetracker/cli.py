@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import db, metrics
+from . import db, metrics, notify
 from .config import get_settings
 from .log import get_logger
 from .log import setup as setup_logging
@@ -129,15 +129,30 @@ def cmd_watch(args) -> int:
 
     interval = max(args.interval_minutes, 0.01) * 60
     runs = 0
+    last_prune = time.monotonic()  # prune is checked on later cycles
     logger.info("watch starting", lock=args.lock, interval_minutes=args.interval_minutes)
     try:
         while not _STOP:
             runs += 1
             logger.info("run starting", run=runs)
-            code = _run_crawl_subprocess(args)
 
             conn = db.connect(_db_target(args))
             db.init_schema(conn)
+            notify.retry_due(conn, settings, logger=logger)
+
+            if settings.prune_every_hours > 0 and (
+                time.monotonic() - last_prune >= settings.prune_every_hours * 3600
+            ):
+                deleted = db.prune(conn, keep_days=settings.prune_keep_days)
+                last_prune = time.monotonic()
+                logger.info(
+                    "retention prune ran",
+                    keep_days=settings.prune_keep_days,
+                    deleted=deleted,
+                )
+
+            code = _run_crawl_subprocess(args)
+
             export_all(conn, args.out)
             print_report(conn, limit=5)
             latest = db.fetch_runs(conn, limit=1)
@@ -247,6 +262,32 @@ def cmd_init_db(args) -> int:
     return 0
 
 
+def cmd_retry_alerts(args) -> int:
+    settings = get_settings()
+    conn = db.connect(_db_target(args))
+    db.init_schema(conn)
+    counts = notify.retry_due(conn, settings, limit=args.limit)
+    counts_by_status = db.alert_counts(conn)
+    conn.close()
+    print(
+        f"Retried {counts['retried']} due alert(s): "
+        f"{counts['sent']} sent, {counts['failed']} still failing, {counts['dead']} dead"
+    )
+    if counts_by_status:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(counts_by_status.items()))
+        print(f"Alert rows by status: {summary}")
+    return 0
+
+
+def cmd_migrate(args) -> int:
+    from . import migrate as migrations
+
+    target = _db_target(args)
+    migrations.upgrade(target)
+    print(f"Schema upgraded to head at {db.normalize_url(target)}")
+    return 0
+
+
 def cmd_demo_shop(args) -> int:
     from .demo_shop import serve
 
@@ -316,9 +357,20 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--keep-days", type=int, default=90)
     prune.set_defaults(func=cmd_prune)
 
-    init_db = sub.add_parser("init-db", help="Create the schema (idempotent)")
+    init_db = sub.add_parser("init-db", help="Create the schema (idempotent, for tests/demos)")
     _add_db_option(init_db)
     init_db.set_defaults(func=cmd_init_db)
+
+    migrate = sub.add_parser("migrate", help="Apply Alembic migrations (use this in production)")
+    _add_db_option(migrate)
+    migrate.set_defaults(func=cmd_migrate)
+
+    retry_alerts = sub.add_parser(
+        "retry-alerts", help="Re-deliver failed alerts whose retry backoff has elapsed"
+    )
+    _add_db_option(retry_alerts)
+    retry_alerts.add_argument("--limit", type=int, default=20)
+    retry_alerts.set_defaults(func=cmd_retry_alerts)
 
     shop = sub.add_parser(
         "demo-shop",

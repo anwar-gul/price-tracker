@@ -181,3 +181,75 @@ def test_email_delivery_uses_legacy_smtp_config(monkeypatch, conn, tmp_path):
     assert sent["host"] == "smtp.example.com"
     assert sent["tls"] is True
     assert "Widget" in sent["subject"]
+
+
+def alert_rows(conn) -> list:
+    from sqlalchemy import select
+
+    return list(conn.execute(select(db.alerts).order_by(db.alerts.c.id)).mappings().all())
+
+
+def test_failed_alert_records_outbox_fields(conn, tmp_path):
+    settings = make_settings(
+        webhook_url="http://127.0.0.1:9/nothing", webhook_retries=1,
+        alert_log=str(tmp_path / "a.log"),
+    )
+    notify.notify_drops(conn, [drop()], settings)
+
+    row = alert_rows(conn)[0]
+    assert row["status"] == "failed"
+    assert row["channel"] == "webhook"
+    assert row["attempts"] == 1
+    assert row["next_attempt_at"] is not None
+    payload = json.loads(row["payload"])
+    assert payload["event"] == "price_drop"
+    assert "Widget" in payload["message"]
+
+
+def test_retry_due_resends_failed_webhook(conn, tmp_path):
+    with receiver(fail_first=1) as server:
+        url = f"http://127.0.0.1:{server.server_address[1]}/hook"
+        settings = make_settings(
+            webhook_url=url, webhook_retries=1, alert_retry_base_seconds=0,
+            alert_log=str(tmp_path / "a.log"),
+        )
+        first = notify.notify_drops(conn, [drop()], settings)
+        assert first["failed"] == 1
+
+        counts = notify.retry_due(conn, settings)
+
+    assert counts == {"retried": 1, "sent": 1, "failed": 0, "dead": 0}
+    assert len(server.requests) == 2  # original + retry
+    row = alert_rows(conn)[0]
+    assert row["status"] == "sent"
+    assert row["attempts"] == 2
+    assert row["next_attempt_at"] is None
+
+
+def test_retry_waits_for_backoff(conn, tmp_path):
+    settings = make_settings(
+        webhook_url="http://127.0.0.1:9/nothing", webhook_retries=1,
+        alert_retry_base_seconds=3600, alert_log=str(tmp_path / "a.log"),
+    )
+    notify.notify_drops(conn, [drop()], settings)
+
+    counts = notify.retry_due(conn, settings)
+    assert counts["retried"] == 0  # scheduled an hour out
+
+
+def test_retry_marks_dead_after_max_attempts(conn, tmp_path):
+    settings = make_settings(
+        webhook_url="http://127.0.0.1:9/nothing", webhook_retries=1,
+        alert_retry_base_seconds=0, alert_max_attempts=2,
+        alert_log=str(tmp_path / "a.log"),
+    )
+    notify.notify_drops(conn, [drop()], settings)
+
+    first_retry = notify.retry_due(conn, settings)
+    assert first_retry["dead"] == 1
+
+    row = alert_rows(conn)[0]
+    assert row["status"] == "dead"
+    assert row["attempts"] == 2
+
+    assert notify.retry_due(conn, settings)["retried"] == 0  # dead rows are not retried

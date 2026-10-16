@@ -3,6 +3,7 @@ scrapy-playwright==0.0.48
 playwright==1.64.0
 openpyxl==3.1.5
 SQLAlchemy==2.1.4
+alembic==1.20.0
 pydantic-settings==2.16.0
 structlog==26.1.0
 prometheus-client==0.26.0
