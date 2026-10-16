@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pricetracker"
+version = "0.2.0"
+description = "Scrapy price tracker: SQLite/Postgres history, change alerts, CSV/Excel exports"
+requires-python = ">=3.11"
+dependencies = [
+    "scrapy>=2.13",
+    "scrapy-playwright>=0.0.40",
+    "playwright>=1.45",
+    "openpyxl>=3.1",
+    "SQLAlchemy>=2.0",
+    "pydantic-settings>=2.5",
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+    "filelock>=3.16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8", "psycopg[binary]>=3.2"]
+postgres = ["psycopg[binary]>=3.2"]
+
+[project.scripts]
+pricetracker = "pricetracker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pricetracker*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: launches a real Chromium (skips when chromium is missing)",
+    "pg: requires PRICETRACKER_TEST_PG_URL pointing at a throwaway Postgres",
+]

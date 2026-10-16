@@ -1,0 +1,45 @@
+name: pricetracker
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pricetracker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-pricetracker}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pricetracker}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  scheduler:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PRICETRACKER_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pricetracker}:${POSTGRES_PASSWORD:-change-me}@db:5432/${POSTGRES_DB:-pricetracker}
+      PRICETRACKER_LOG_FORMAT: json
+      PRICETRACKER_WEBHOOK_URL: ${PRICETRACKER_WEBHOOK_URL:-}
+      PRICETRACKER_USER_AGENT: "${PRICETRACKER_USER_AGENT:-pricetracker/0.2 (contact: set PRICETRACKER_USER_AGENT)}"
+    command: ["watch", "--interval-minutes", "60", "--metrics-port", "9109"]
+    ports:
+      - "9109:9109"
+    volumes:
+      - tracker-state:/app/data
+      - exports:/app/exports
+    healthcheck:
+      test: ["CMD", "python", "-m", "pricetracker", "status", "--check-max-age-minutes", "120"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 10m
+
+volumes:
+  pgdata:
+  tracker-state:
+  exports:

@@ -1,0 +1,21 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>JS Demo Shop</title></head>
+<body>
+<h1>JS Demo Shop</h1>
+<p>Prices are rendered client-side after 0.5s — invisible to plain HTTP crawlers.</p>
+<div id="catalog"><article class="product_pod"><h3><a href="/product/aeron-chair" title="Aeron Chair">Aeron Chair</a></h3><p class="star-rating Five"></p><p class="price_color">£1,299.00</p><p class="instock availability">In stock</p></article><article class="product_pod"><h3><a href="/product/standing-desk" title="Standing Desk">Standing Desk</a></h3><p class="star-rating Four"></p><p class="price_color">£649.00</p><p class="instock availability">In stock</p></article><article class="product_pod"><h3><a href="/product/monitor-arm" title="Monitor Arm">Monitor Arm</a></h3><p class="star-rating Four"></p><p class="price_color">£129.00</p><p class="instock availability">In stock</p></article><article class="product_pod"><h3><a href="/product/mechanical-keyboard" title="Mechanical Keyboard">Mechanical Keyboard</a></h3><p class="star-rating Five"></p><p class="price_color">£159.00</p><p class="instock availability">In stock</p></article><article class="product_pod"><h3><a href="/product/noise-cancelling-headphones" title="Noise-Cancelling Headphones">Noise-Cancelling Headphones</a></h3><p class="star-rating Three"></p><p class="price_color">£299.00</p><p class="instock availability">In stock</p></article><article class="product_pod"><h3><a href="/product/usb-c-dock" title="USB-C Dock">USB-C Dock</a></h3><p class="star-rating Four"></p><p class="price_color">£189.00</p><p class="instock availability">In stock</p></article><ul class="pager"><li class="next"><a href="?page=2">next</a></li></ul></div>
+<script>
+(() => {
+  const page = parseInt(new URLSearchParams(location.search).get("page") || "1", 10);
+  setTimeout(async () => {
+    const res = await fetch(`/api/products?page=${page}`);
+    const data = await res.json();
+    const pager = data.next
+      ? `<ul class="pager"><li class="next"><a href="?page=${page + 1}">next</a></li></ul>`
+      : "";
+    document.getElementById("catalog").innerHTML = data.html + pager;
+  }, 0.5 * 1000);
+})();
+</script>
+
+
+</body></html>
