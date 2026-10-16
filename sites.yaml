@@ -1,0 +1,49 @@
+# Per-site configuration: track many shops with one command.
+#
+#   python -m pricetracker crawl --site demo-shop
+#   python -m pricetracker watch --site books --interval-minutes 60
+#
+# YAML (this file) needs PyYAML; a .json file with the same shape also works.
+
+sites:
+  # The default books.toscrape.com catalogue (static HTML spider).
+  - name: books
+    spider: books
+    start_url: https://books.toscrape.com/catalogue/page-1.html
+    max_pages: 2
+
+  # A JavaScript-rendered catalogue: pages are rendered in Chromium first.
+  # Matches the README demo: demo-shop --port 8765
+  - name: demo-shop
+    spider: jscatalog
+    start_url: http://localhost:8765/
+    render: true
+    max_pages: 2
+
+  # A shop with different markup: teach the generic spider where things are.
+  # Selectors are scoped to each product card element.
+  - name: shop-with-custom-markup
+    spider: generic
+    start_url: https://shop.example.com/catalog
+    pagination: "a.next-page::attr(href)"
+    selectors:
+      product: "div.product-card"
+      title: "h2::text"
+      link: "a.product-link::attr(href)"
+      price: ".price::text"
+      rating: ".rating::attr(data-score)"   # "4" or "star-rating Four" both parse
+      stock: ".stock::text"                 # "In stock" / "Out of stock"
+
+  # A login-gated shop: credentials come from environment variables, and
+  # CSRF-protected two-step forms are supported.
+  - name: partner-portal
+    spider: logincatalog
+    start_url: https://partners.example.com/login
+    login:
+      username_env: PARTNER_USER
+      password_env: PARTNER_PASSWORD
+      next_selector: "button[name=next]"
+      submit_selector: "button[name=signin]"
+      csrf_selector: "meta[name=csrf-token]"
+      csrf_input: "input[name=csrf_token]"
+      error_selector: ".error"

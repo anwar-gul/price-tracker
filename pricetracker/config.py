@@ -71,6 +71,18 @@ class Settings(BaseSettings):
     proxy_url: str | None = None
     playwright_connect_url: str | None = None
 
+    # --- remote pushes (Google Sheets / Airtable) ---
+    airtable_token: str | None = None
+    airtable_base: str | None = None
+    airtable_table: str = "Catalog"
+    airtable_api_base: str = "https://api.airtable.com"
+    gsheets_credentials: str | None = None
+    gsheets_spreadsheet: str | None = None
+    gsheets_worksheet: str = "Catalog"
+    push_retries: int = 3
+    push_timeout_seconds: float = 15.0
+    push_backoff_seconds: float = 1.0
+
     # --- ops ---
     metrics_port: int = 0
     prune_keep_days: int = 90
@@ -114,14 +126,14 @@ class Settings(BaseSettings):
         return value
 
     @field_validator("alert_cooldown_hours", "webhook_backoff_seconds", "webhook_timeout_seconds",
-                     "prune_every_hours")
+                     "prune_every_hours", "push_timeout_seconds", "push_backoff_seconds")
     @classmethod
     def _non_negative(cls, value: float) -> float:
         if value < 0:
             raise ValueError("must be >= 0")
         return value
 
-    @field_validator("alert_max_attempts", "prune_keep_days")
+    @field_validator("alert_max_attempts", "prune_keep_days", "push_retries")
     @classmethod
     def _positive_int(cls, value: int) -> int:
         if value < 1:
@@ -135,6 +147,18 @@ class Settings(BaseSettings):
     @property
     def webhook_configured(self) -> bool:
         return bool(self.webhook_url)
+
+    @property
+    def airtable_configured(self) -> bool:
+        return bool(self.airtable_token and self.airtable_base and self.airtable_table)
+
+    @property
+    def gsheets_configured(self) -> bool:
+        return bool(self.gsheets_credentials and self.gsheets_spreadsheet)
+
+    @property
+    def push_configured(self) -> bool:
+        return self.airtable_configured or self.gsheets_configured
 
 
 @lru_cache(maxsize=1)

@@ -107,3 +107,46 @@ def test_logincatalog_crawl_end_to_end(tmp_path):
 
     assert stats["books"] == 12  # login -> 2 rendered pages x 6 products
     assert "Standing Desk" in titles
+
+
+@pytest.mark.integration
+def test_logincatalog_csrf_two_step_end_to_end(tmp_path):
+    """CSRF token read from a meta tag + username/password on separate pages."""
+    if not chromium_available():
+        pytest.skip("chromium not installed (run: .venv/bin/playwright install chromium)")
+
+    server = create_server(port=0, delay=0.3, user="demo", password="demo",
+                           csrf=True, two_step=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    db_path = tmp_path / "csrf.db"
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pricetracker", "crawl",
+                "--spider", "logincatalog",
+                "--start-url", f"http://127.0.0.1:{port}/login",
+                "--username", "demo", "--password", "demo",
+                "--csrf-selector", "meta[name=csrf-token]",
+                "--next-selector", "button[name=next]",
+                "--submit-selector", "button[name=signin]",
+                "--error-selector", ".error",
+                "--db", str(db_path),
+                "-L", "WARNING",
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stderr
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    conn = db.connect(db_path)
+    stats = db.stats(conn)
+    conn.close()
+
+    assert stats["books"] == 12  # two-step CSRF login -> 2 rendered pages x 6 products

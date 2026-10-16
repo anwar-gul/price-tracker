@@ -45,7 +45,8 @@ class RunStatsExtension:
     def spider_opened(self, spider):
         self.conn = db.connect(self.db_target)
         db.init_schema(self.conn)
-        self.run_id = db.start_run(self.conn, spider.name)
+        self.run_name = getattr(spider, "run_name", None) or spider.name
+        self.run_id = db.start_run(self.conn, self.run_name)
         self.previous = db.latest_successful_run(self.conn, before_id=self.run_id)
 
     def spider_closed(self, spider, reason):
@@ -73,7 +74,7 @@ class RunStatsExtension:
             and self.previous["items"] > 0
         ):
             notify.notify_zero_items(
-                self.conn, self.settings, spider.name, self.previous["items"], logger=get_logger()
+                self.conn, self.settings, self.run_name, self.previous["items"], logger=get_logger()
             )
         self.conn.close()
         self.conn = None

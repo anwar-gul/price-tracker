@@ -10,13 +10,14 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import db, metrics, notify
+from . import db, metrics, notify, push
 from .config import get_settings
 from .log import get_logger
 from .log import setup as setup_logging
 from .report import export_all, print_report
+from .sites import SitesError, resolve_site
 
-SPIDERS = ("books", "jscatalog", "logincatalog")
+SPIDERS = ("books", "jscatalog", "logincatalog", "generic")
 
 _STOP = False
 
@@ -46,6 +47,60 @@ def _age_minutes(iso: str | None) -> float | None:
     return (time.time() - epoch) / 60.0
 
 
+LOGIN_KEYS = {
+    "csrf_selector": "csrf-selector",
+    "csrf_input": "csrf-input",
+    "csrf_attribute": "csrf-attribute",
+    "next_selector": "next-selector",
+    "submit_selector": "submit-selector",
+    "error_selector": "error-selector",
+}
+
+
+def _site_crawl_args(args) -> tuple[str, dict]:
+    """Resolve --site from the sites file into spider kwargs.
+
+    Explicit command-line flags override values from the file (the caller
+    merges them afterwards).
+    """
+    site = resolve_site(args.sites_file, args.site)
+    kwargs: dict = {
+        "run_name": site.name,
+        "start_url": site.start_url,
+        "max_pages": site.max_pages,
+        "wait_selector": site.wait_selector,
+    }
+    if site.spider == "generic":
+        kwargs.update(
+            selectors=site.selectors.model_dump() if site.selectors else None,
+            pagination=site.pagination,
+            render="1" if site.render else "0",
+        )
+    elif site.spider == "logincatalog":
+        login = site.login
+        if login is None:
+            raise SitesError(f"site {site.name!r} uses logincatalog but has no login section")
+        kwargs.update(
+            username=args.username or os.environ.get(login.username_env),
+            password=args.password or os.environ.get(login.password_env),
+            username_selector=login.username_selector,
+            password_selector=login.password_selector,
+            submit_selector=login.submit_selector,
+            csrf_selector=login.csrf_selector,
+            csrf_input=login.csrf_input,
+            csrf_attribute=login.csrf_attribute,
+            next_selector=login.next_selector,
+            error_selector=login.error_selector,
+            wait_selector=login.wait_selector or site.wait_selector,
+        )
+        if not kwargs["username"] or not kwargs["password"]:
+            raise SitesError(
+                f"site {site.name!r}: set {login.username_env} and {login.password_env} "
+                "environment variables (or pass --username/--password)"
+            )
+    return site.spider, {key: value for key, value in kwargs.items() if value is not None}
+
+
 def cmd_crawl(args) -> int:
     from scrapy.crawler import CrawlerProcess
     from scrapy.utils.project import get_project_settings
@@ -58,14 +113,29 @@ def cmd_crawl(args) -> int:
     scrapy_settings.set("ALERT_LOG", settings.alert_log, priority="cmdline")
     scrapy_settings.set("LOG_LEVEL", args.loglevel or settings.log_level, priority="cmdline")
 
+    spider = args.spider
     kwargs = {"max_pages": args.max_pages, "start_url": args.start_url}
+    if args.site:
+        try:
+            spider, site_kwargs = _site_crawl_args(args)
+        except SitesError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for key, value in kwargs.items():
+            if value is not None:
+                site_kwargs[key] = value
+        kwargs = site_kwargs
     if args.username:
         kwargs["username"] = args.username
     if args.password:
         kwargs["password"] = args.password
+    for key in LOGIN_KEYS:
+        value = getattr(args, key)
+        if value:
+            kwargs[key] = value
 
     process = CrawlerProcess(scrapy_settings)
-    process.crawl(args.spider, **kwargs)
+    process.crawl(spider, **kwargs)
     process.start()
 
     conn = db.connect(target)
@@ -93,6 +163,12 @@ def _run_crawl_subprocess(args) -> int:
         command += ["--username", args.username]
     if args.password:
         command += ["--password", args.password]
+    if args.site:
+        command += ["--site", args.site, "--sites-file", args.sites_file]
+    for key, flag in LOGIN_KEYS.items():
+        value = getattr(args, key)
+        if value:
+            command += [f"--{flag}", value]
     return subprocess.run(command).returncode
 
 
@@ -193,6 +269,20 @@ def cmd_watch(args) -> int:
 
             export_all(conn, args.out)
             print_report(conn, limit=5)
+
+            if args.push:
+                if settings.push_configured:
+                    try:
+                        results = push.push_all(conn, settings, logger=logger)
+                        logger.info(
+                            "catalog pushed",
+                            targets=", ".join(f"{k}={v}" for k, v in results.items()),
+                        )
+                    except push.PushError as exc:
+                        logger.warning("push failed", error=str(exc))
+                else:
+                    logger.warning("push requested but no targets configured")
+
             latest = db.fetch_runs(conn, limit=1)
 
             if lease_enabled:
@@ -337,6 +427,23 @@ def cmd_retry_alerts(args) -> int:
     return 0
 
 
+def cmd_push(args) -> int:
+    settings = get_settings()
+    conn = db.connect(_db_target(args))
+    db.init_schema(conn)
+    targets = None if args.target == "all" else [args.target]
+    try:
+        results = push.push_all(conn, settings, targets=targets)
+    except push.PushError as exc:
+        print(f"push failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    for target, count in results.items():
+        print(f"{target}: pushed {count} record(s)")
+    return 0
+
+
 def cmd_migrate(args) -> int:
     from . import migrate as migrations
 
@@ -349,7 +456,15 @@ def cmd_migrate(args) -> int:
 def cmd_demo_shop(args) -> int:
     from .demo_shop import serve
 
-    serve(port=args.port, delay=args.delay, sale=args.sale, user=args.user, password=args.password)
+    serve(
+        port=args.port,
+        delay=args.delay,
+        sale=args.sale,
+        user=args.user,
+        password=args.password,
+        csrf=args.csrf,
+        two_step=args.two_step,
+    )
     return 0
 
 
@@ -364,12 +479,30 @@ def _add_db_option(parser: argparse.ArgumentParser) -> None:
 def _add_crawl_options(parser: argparse.ArgumentParser) -> None:
     _add_db_option(parser)
     parser.add_argument("--spider", choices=SPIDERS, default="books",
-                        help="books = static, jscatalog = Playwright-rendered, logincatalog = behind login")
+                        help="books = static, jscatalog = Playwright-rendered, "
+                             "logincatalog = behind login, generic = selector-driven")
+    parser.add_argument("--site", default=None,
+                        help="Got a sites.yaml? Track a named site: --site NAME "
+                             "(sets spider, start URL, selectors, login)")
+    parser.add_argument("--sites-file", default="sites.yaml",
+                        help="Sites config used by --site (YAML or JSON)")
     parser.add_argument("--start-url", default=None, help="Override the spider's start URL")
     parser.add_argument("--max-pages", type=int, default=None, help="Stop after N catalogue pages")
     parser.add_argument("-L", "--loglevel", default=None, help="Scrapy log level")
     parser.add_argument("--username", default=None, help="Login user (logincatalog spider)")
     parser.add_argument("--password", default=None, help="Login password (logincatalog spider)")
+    parser.add_argument("--csrf-selector", default=None,
+                        help="Read a CSRF token from this selector before submitting")
+    parser.add_argument("--csrf-input", default=None,
+                        help="Form field to fill with the CSRF token (default: input[name=csrf_token])")
+    parser.add_argument("--csrf-attribute", default=None,
+                        help="Attribute holding the token (default: content, use value for hidden inputs)")
+    parser.add_argument("--next-selector", default=None,
+                        help="Multi-step login: click this to advance from the username step")
+    parser.add_argument("--submit-selector", default=None,
+                        help="Login submit button (default: button[type=submit])")
+    parser.add_argument("--error-selector", default=None,
+                        help="Login error element; when it appears the flow fails fast")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -395,6 +528,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--lease-seconds", type=int, default=None,
                        help="Multi-replica mode: lead via a database lease with this TTL "
                             "(standby replicas take over when the leader stops renewing)")
+    watch.add_argument("--push", action="store_true",
+                       help="Push the catalog to configured remote targets (Sheets/Airtable) "
+                            "after every run")
     watch.set_defaults(func=cmd_watch)
 
     export = sub.add_parser("export", help="Export catalog + history to CSV/Excel")
@@ -433,6 +569,13 @@ def build_parser() -> argparse.ArgumentParser:
     retry_alerts.add_argument("--limit", type=int, default=20)
     retry_alerts.set_defaults(func=cmd_retry_alerts)
 
+    push_cmd = sub.add_parser(
+        "push", help="Push the catalog to Google Sheets / Airtable"
+    )
+    _add_db_option(push_cmd)
+    push_cmd.add_argument("--target", choices=("all", "airtable", "sheets"), default="all")
+    push_cmd.set_defaults(func=cmd_push)
+
     shop = sub.add_parser(
         "demo-shop",
         help="Serve a local JS-rendered catalog to demo the Playwright spider",
@@ -444,6 +587,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Discount %% applied to all prices (demo price drops)")
     shop.add_argument("--user", default=None, help="Enable login gate with this username")
     shop.add_argument("--password", default=None, help="Login password (with --user)")
+    shop.add_argument("--csrf", action="store_true",
+                      help="CSRF-protect the login form (token in a meta tag, empty hidden field)")
+    shop.add_argument("--two-step", action="store_true",
+                      help="Username page followed by a password page")
     shop.set_defaults(func=cmd_demo_shop)
 
     return parser

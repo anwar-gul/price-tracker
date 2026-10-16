@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from pricetracker import db, migrate
 
@@ -66,12 +66,15 @@ def test_postgres_migration_roundtrip():
 
     conn = db.connect(url)
     db.metadata.drop_all(conn)
+    # Other tests drop metadata tables but the version stamp would survive,
+    # turning this upgrade into a no-op. Start truly clean.
+    conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
     conn.commit()
     conn.close()
 
     migrate.upgrade(url)
     conn = db.connect(url)
     names = _table_names(conn)
-    assert {"books", "price_history", "price_changes", "alerts", "runs"} <= names
+    assert {"books", "price_history", "price_changes", "alerts", "runs", "locks"} <= names
     assert migrate.current(url) is not None
     conn.close()

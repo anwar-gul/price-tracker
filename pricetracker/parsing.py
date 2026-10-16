@@ -5,6 +5,7 @@ import re
 RATING_WORDS = {"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
 
 _PRICE_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)")
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 
 
 def parse_price(text: str | None) -> float | None:
@@ -21,10 +22,16 @@ def parse_price(text: str | None) -> float | None:
 
 
 def parse_rating(class_attr: str | None) -> int | None:
-    """'star-rating Three' -> 3"""
+    """'star-rating Three' -> 3  |  '4' -> 4  |  '4.5 stars' -> 5 (0-5 scale)"""
     if not class_attr:
         return None
     for word in class_attr.split():
         if word in RATING_WORDS:
             return RATING_WORDS[word]
+    match = _NUMBER_RE.search(class_attr)
+    if not match:
+        return None
+    value = float(match.group())
+    if 0 <= value <= 5:
+        return int(round(value))
     return None

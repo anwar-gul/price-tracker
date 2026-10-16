@@ -8,4 +8,5 @@ pydantic-settings==2.16.0
 structlog==26.1.0
 prometheus-client==0.26.0
 filelock==4.2.0
+PyYAML==6.0.3
 psycopg[binary]==3.3.6

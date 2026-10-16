@@ -18,6 +18,9 @@ LEASE = Gauge(
     "pricetracker_lease_held",
     "1 when this instance currently leads the watch lease, 0 when standing by",
 )
+PUSHES = Counter(
+    "pricetracker_push_total", "Catalog pushes to remote targets", ["target", "status"]
+)
 
 
 def start(port: int) -> None:
@@ -35,3 +38,7 @@ def record_run(status: str, items: int, drops: int, finished_at_epoch: float | N
 
 def record_alert(channel: str, status: str) -> None:
     ALERTS.labels(channel=channel, status=status).inc()
+
+
+def record_push(target: str, status: str) -> None:
+    PUSHES.labels(target=target, status=status).inc()

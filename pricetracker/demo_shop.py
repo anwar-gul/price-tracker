@@ -8,6 +8,12 @@ Optional login gate (`--user`/`--password`): all pages require a session
 cookie obtained via the POST /login form — used to demo login-based
 session handling (spiders/logincatalog.py).
 
+Optional `--csrf` makes the login form CSRF-protected: the token lives in a
+<meta name="csrf-token"> tag and the hidden form field is empty, so the
+spider must read the token and fill the field itself (single-use tokens,
+403 on mismatch). Optional `--two-step` splits the login into a username
+page followed by a password page, like many real shops.
+
 Rendered DOM mirrors books.toscrape.com's structure (article.product_pod,
 p.price_color, star-rating <Word>, p.instock.availability, li.next) so the
 same extractor works for both targets.
@@ -64,18 +70,21 @@ SHELL = """<!doctype html>
 
 LOGIN_PAGE = """<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Sign in</title></head>
+<head><meta charset="utf-8"><title>Sign in</title>__CSRF_META__</head>
 <body>
 <h1>Sign in</h1>
 __ERROR__
 <form method="post" action="/login">
+  __CSRF_INPUT____STAGE__
   <input name="username" placeholder="username" autocomplete="username">
-  <input name="password" type="password" placeholder="password" autocomplete="current-password">
-  <button type="submit">Sign in</button>
+  __PASSWORD__
+  __BUTTON__
 </form>
 </body>
 </html>
 """
+
+PASSWORD_FIELD = """<input name="password" type="password" placeholder="password" autocomplete="current-password">"""
 
 
 def _slug(name: str) -> str:
@@ -131,20 +140,76 @@ class _Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
-    def _login_page(self, error: bool = False):
-        body = LOGIN_PAGE.replace(
-            "__ERROR__",
-            '<p class="error">Invalid credentials</p>' if error else "",
-        ).encode()
+    def _login_page(self, error: bool = False, stage: str | None = None):
+        """Render the login page (step 1 of 2, or the only step).
+
+        With --csrf a fresh single-use token is embedded in the meta tag,
+        while the hidden form field stays empty on purpose.
+        """
+        config = self.server.config
+        csrf_meta = csrf_input = ""
+        if config["csrf"]:
+            token = secrets.token_hex(16)
+            self.server.csrf_tokens.add(token)
+            csrf_meta = f'<meta name="csrf-token" content="{token}">'
+            csrf_input = '<input type="hidden" name="csrf_token" value="">'
+        stage_input = f'<input type="hidden" name="stage" value="{stage}">' if stage else ""
+
+        if config["two_step"] and stage is None:
+            password = ""
+            button = '<button type="submit" name="next" value="1">Next</button>'
+        else:
+            password = PASSWORD_FIELD
+            button = '<button type="submit" name="signin" value="1">Sign in</button>'
+
+        body = (
+            LOGIN_PAGE.replace("__CSRF_META__", csrf_meta)
+            .replace("__CSRF_INPUT__", csrf_input)
+            .replace("__STAGE__", stage_input)
+            .replace("__PASSWORD__", password)
+            .replace("__BUTTON__", button)
+            .replace(
+                "__ERROR__",
+                '<p class="error">Invalid credentials</p>' if error else "",
+            )
+            .encode()
+        )
         self._send(401 if error else 200, "text/html; charset=utf-8", body)
 
     def _login(self):
         length = int(self.headers.get("Content-Length", "0"))
         form = parse_qs(self.rfile.read(length).decode("utf-8"))
-        username = form.get("username", [""])[0]
-        password = form.get("password", [""])[0]
         config = self.server.config
 
+        if config["csrf"]:
+            token = form.get("csrf_token", [""])[0]
+            if not token or token not in self.server.csrf_tokens:
+                self._page(403, "CSRF validation failed")
+                return
+            self.server.csrf_tokens.discard(token)
+
+        if config["two_step"]:
+            stage = form.get("stage", [""])[0]
+            if stage:
+                username = self.server.pending.pop(stage, None)
+                if username is None:
+                    self._page(400, "Login flow expired, start over")
+                    return
+                self._finish_login(username, form.get("password", [""])[0])
+                return
+            username = form.get("username", [""])[0]
+            if not username:
+                self._login_page(error=True, stage=None)
+                return
+            pending = secrets.token_hex(8)
+            self.server.pending[pending] = username
+            self._login_page(stage=pending)
+            return
+
+        self._finish_login(form.get("username", [""])[0], form.get("password", [""])[0])
+
+    def _finish_login(self, username: str, password: str):
+        config = self.server.config
         if hmac.compare_digest(username, config["user"]) and hmac.compare_digest(
             password, config["password"]
         ):
@@ -156,6 +221,16 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             self._login_page(error=True)
+
+    def _page(self, code: int, message: str):
+        self._send(
+            code,
+            "text/html; charset=utf-8",
+            (
+                f'<!doctype html><html><body><h1>{code}</h1>'
+                f'<p class="error">{message}</p></body></html>'
+            ).encode(),
+        )
 
     def _redirect(self, location: str):
         self.send_response(303)
@@ -198,10 +273,14 @@ def create_server(
     sale: float = 0.0,
     user: str | None = None,
     password: str | None = None,
+    csrf: bool = False,
+    two_step: bool = False,
 ) -> ThreadingHTTPServer:
     """Build (but don't start) the demo shop. port=0 picks a free port.
 
     Set user + password to require login via POST /login (session cookie).
+    Add csrf=True for single-use CSRF tokens (token in a meta tag, empty
+    hidden field) and two_step=True for username-then-password pages.
     """
     catalog = [
         (name, round(price * (1 - sale / 100.0), 2), rating, stock)
@@ -214,8 +293,12 @@ def create_server(
         "auth": bool(user and password),
         "user": user or "",
         "password": password or "",
+        "csrf": bool(csrf and user and password),
+        "two_step": bool(two_step and user and password),
     }
     server.sessions = set()
+    server.csrf_tokens = set()
+    server.pending = {}
     return server
 
 
@@ -225,20 +308,36 @@ def serve(
     sale: float = 0.0,
     user: str | None = None,
     password: str | None = None,
+    csrf: bool = False,
+    two_step: bool = False,
 ) -> None:
-    server = create_server(port=port, delay=delay, sale=sale, user=user, password=password)
+    server = create_server(
+        port=port, delay=delay, sale=sale, user=user, password=password,
+        csrf=csrf, two_step=two_step,
+    )
     actual_port = server.server_address[1]
     auth_note = "auth: ON" if server.config["auth"] else "auth: off"
+    extras = []
+    if server.config["csrf"]:
+        extras.append("csrf")
+    if server.config["two_step"]:
+        extras.append("two-step login")
+    note = f", {', '.join(extras)}" if extras else ""
     print(
         f"JS demo shop: http://localhost:{actual_port}/  "
-        f"(JS delay {delay}s, sale {sale:g}%, {auth_note})"
+        f"(JS delay {delay}s, sale {sale:g}%, {auth_note}{note})"
     )
     print("Crawl it with:  python -m pricetracker crawl --spider jscatalog")
     if server.config["auth"]:
-        print(
+        hint = (
             "Login-gated:    python -m pricetracker crawl --spider logincatalog "
             f"--username {user} --password <password>"
         )
+        if server.config["csrf"]:
+            hint += ' --csrf-selector "meta[name=csrf-token]"'
+        if server.config["two_step"]:
+            hint += ' --next-selector "button[name=next]" --submit-selector "button[name=signin]"'
+        print(hint)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

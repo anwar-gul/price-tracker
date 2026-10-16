@@ -18,11 +18,13 @@ dependencies = [
     "structlog>=24.4",
     "prometheus-client>=0.21",
     "filelock>=3.16",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.8", "psycopg[binary]>=3.2"]
 postgres = ["psycopg[binary]>=3.2"]
+sheets = ["gspread>=6"]
 
 [project.scripts]
 pricetracker = "pricetracker.cli:main"
