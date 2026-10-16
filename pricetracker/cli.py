@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -113,26 +115,62 @@ def _acquire_lock(lock_path: str):
     return lock
 
 
+def _lease_step(conn, owner: str, ttl_seconds: float, holding: bool, logger) -> bool:
+    """Renew the watch lease when held, otherwise try to acquire it."""
+    if holding and db.renew_lease(conn, db.WATCH_LEASE, owner, ttl_seconds):
+        return True
+    if holding:
+        logger.warning("lease lost mid-cycle; trying to re-acquire")
+    return db.acquire_lease(conn, db.WATCH_LEASE, owner, ttl_seconds)
+
+
 def cmd_watch(args) -> int:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_format)
     logger = get_logger("watch")
     metrics.start(args.metrics_port or settings.metrics_port)
 
-    lock = _acquire_lock(args.lock)
-    if lock is None:
-        logger.error("another watch is already running, exiting", lock=args.lock)
-        return 1
+    lease_seconds = args.lease_seconds if args.lease_seconds is not None else settings.lease_seconds
+    owner = settings.instance_id or f"{socket.gethostname()}:{os.getpid()}"
+    lease_enabled = lease_seconds > 0
+
+    if lease_enabled:
+        # Multi-replica mode: leadership is decided by a database lease, so
+        # standby replicas stay up and take over when the leader dies.
+        lock = None
+    else:
+        lock = _acquire_lock(args.lock)
+        if lock is None:
+            logger.error("another watch is already running, exiting", lock=args.lock)
+            return 1
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
     interval = max(args.interval_minutes, 0.01) * 60
     runs = 0
+    holding = False
     last_prune = time.monotonic()  # prune is checked on later cycles
-    logger.info("watch starting", lock=args.lock, interval_minutes=args.interval_minutes)
+    logger.info(
+        "watch starting",
+        lock=args.lock,
+        interval_minutes=args.interval_minutes,
+        lease_seconds=lease_seconds if lease_enabled else None,
+        owner=owner if lease_enabled else None,
+    )
     try:
         while not _STOP:
+            if lease_enabled:
+                conn = db.connect(_db_target(args))
+                db.init_schema(conn)
+                holding = _lease_step(conn, owner, lease_seconds, holding, logger)
+                conn.close()
+                metrics.LEASE.set(1 if holding else 0)
+                if not holding:
+                    logger.info("standing by: another instance holds the lease")
+                    _sleep_interruptible(interval)
+                    continue
+
             runs += 1
             logger.info("run starting", run=runs)
 
@@ -156,6 +194,13 @@ def cmd_watch(args) -> int:
             export_all(conn, args.out)
             print_report(conn, limit=5)
             latest = db.fetch_runs(conn, limit=1)
+
+            if lease_enabled:
+                holding = db.renew_lease(conn, db.WATCH_LEASE, owner, lease_seconds)
+                if not holding:
+                    logger.warning("lease lost during run; another instance took over")
+                metrics.LEASE.set(1 if holding else 0)
+
             conn.close()
             if latest:
                 row = latest[0]
@@ -172,7 +217,12 @@ def cmd_watch(args) -> int:
             logger.info("sleeping", minutes=round(interval / 60, 2))
             _sleep_interruptible(interval)
     finally:
-        lock.release()
+        if lease_enabled and holding:
+            conn = db.connect(_db_target(args))
+            db.release_lease(conn, db.WATCH_LEASE, owner)
+            conn.close()
+        if lock is not None:
+            lock.release()
     logger.info("watch stopped", runs=runs)
     return 0
 
@@ -202,6 +252,8 @@ def cmd_status(args) -> int:
     counts = db.stats(conn)
     latest_runs = db.fetch_runs(conn, limit=5)
     last_success = db.latest_successful_run(conn)
+    lease = db.fetch_lease(conn, db.WATCH_LEASE)
+    now = db.now_iso()
     conn.close()
 
     print("price-tracker status")
@@ -235,6 +287,12 @@ def cmd_status(args) -> int:
                 f"  {row['started_at']}  {row['spider']:<13} {row['status']:<8} "
                 f"items={row['items']} changes={row['changes']} drops={row['drops']}"
             )
+
+    if lease is not None:
+        expired = lease["expires_at"] < now
+        state = "expired" if expired else "active"
+        print()
+        print(f"Watch lease ({state}): owner={lease['owner']} until={lease['expires_at']}")
 
     if stale:
         print()
@@ -334,6 +392,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Lock file preventing overlapping watch processes")
     watch.add_argument("--metrics-port", type=int, default=0,
                        help="Expose Prometheus metrics on this port (0 = off)")
+    watch.add_argument("--lease-seconds", type=int, default=None,
+                       help="Multi-replica mode: lead via a database lease with this TTL "
+                            "(standby replicas take over when the leader stops renewing)")
     watch.set_defaults(func=cmd_watch)
 
     export = sub.add_parser("export", help="Export catalog + history to CSV/Excel")

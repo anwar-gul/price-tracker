@@ -32,7 +32,18 @@ jobs:
           key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements*.txt') }}
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m playwright install --with-deps chromium
-      - run: python -m pytest -q
+      - run: python -m pytest -q -m "not load"
+
+  load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Throughput benchmarks (ingest + end-to-end crawl)
+        run: python -m pytest -q -m load -s
 
   postgres:
     runs-on: ubuntu-latest

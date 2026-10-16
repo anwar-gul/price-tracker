@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     metrics_port: int = 0
     prune_keep_days: int = 90
     prune_every_hours: float = 24.0
+    lease_seconds: int = 0
+    instance_id: str = ""
 
     @field_validator("log_level")
     @classmethod

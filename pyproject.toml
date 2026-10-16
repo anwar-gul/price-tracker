@@ -44,4 +44,5 @@ pythonpath = ["."]
 markers = [
     "integration: launches a real Chromium (skips when chromium is missing)",
     "pg: requires PRICETRACKER_TEST_PG_URL pointing at a throwaway Postgres",
+    "load: throughput benchmarks (run with -m load; excluded from the default CI suite)",
 ]

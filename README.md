@@ -224,6 +224,8 @@ Copy `.env.example` to `.env` to see all of them.
 | `LOG_LEVEL`, `LOG_FORMAT` | `INFO`, `console` | structlog; `json` for fleets |
 | `METRICS_PORT` | `0` (off) | Prometheus endpoint for `watch` |
 | `PRUNE_KEEP_DAYS`, `PRUNE_EVERY_HOURS` | `90`, `24` | `watch` runs retention prune automatically when due (0 hours = off) |
+| `LEASE_SECONDS` | `0` (off) | `watch` leader-election lease TTL for multi-replica HA; TTL should exceed a typical crawl |
+| `INSTANCE_ID` | `hostname:pid` | Stable replica name shown in logs, status and the lease row |
 
 </details>
 
@@ -261,8 +263,15 @@ docker compose run --rm scheduler retry-alerts                        # flush fa
   Every alert is also appended to `alerts.log` regardless.
 - **Retention**: `watch` prunes automatically (default: daily, keep 90 days);
   `prune --keep-days N` for one-off cleanup.
+- **High availability**: run 2+ scheduler replicas (`docker compose up -d --scale scheduler=2`
+  is a start; give each replica its own metrics port or scrape via your orchestrator).
+  With `PRICETRACKER_LEASE_SECONDS` set (compose default: 900), exactly one replica leads
+  each cycle; the others log `standing by` and take over after the lease expires if the
+  leader dies. `status` shows the current lease owner, and `pricetracker_lease_held`
+  exposes leadership as a metric.
 - CI runs ruff, the full pytest suite on Python 3.12/3.13, the Postgres tests against a service
-  container, builds + smoke-tests the image, and scans it (`.github/workflows/ci.yml`).
+  container, builds + smoke-tests the image, scans it, and runs throughput benchmarks
+  (`.github/workflows/ci.yml`).
 
 Stop the services with `docker compose down`. Named volumes retain the stored data.
 The exports live in the Docker `exports` volume, not your local `exports/` folder.
@@ -279,7 +288,7 @@ The exports live in the Docker `exports` volume, not your local `exports/` folde
 | `crawl [--spider books\|jscatalog\|logincatalog] [--start-url U] [--max-pages N] [--username U --password P] [--db PATH\|URL]` | One crawl (exit 0 only if the run succeeded) |
 | `report [--limit N]` | Totals + recent price changes |
 | `export [--out DIR]` | CSV + Excel exports |
-| `watch [--interval-minutes M] [--runs N] [--metrics-port P] [--lock PATH] [--db PATH\|URL]` | Repeating crawl + export + report; second instance exits 1 |
+| `watch [--interval-minutes M] [--runs N] [--metrics-port P] [--lock PATH] [--lease-seconds S] [--db PATH\|URL]` | Repeating crawl + export + report; second instance exits 1 (or with `--lease-seconds`, standbys wait for leadership) |
 | `status [--check-max-age-minutes N]` | DB stats + recent runs; with `--check-max-age-minutes` exits 1 when the last successful run is too old |
 | `prune [--keep-days N]` | Delete history/changes/alerts older than N days, then VACUUM (SQLite) |
 | `migrate` | Apply Alembic schema migrations — use this in production |
@@ -307,7 +316,8 @@ Scheduling with cron:
 - **Alert outbox** — failed deliveries are stored with payload + attempt count, retried automatically on later `watch` cycles (or via `retry-alerts`) with exponential backoff, and marked `dead` after the attempt cap
 - **Exports** — `catalog.csv`, `price_history.csv`, styled `catalog.xlsx` (Catalog + Price Changes sheets, plus a Price Trends sheet with a line chart for up to 10 products with the most history once changes exist)
 - **Scheduling** — `watch` command with **single-instance file lock**, interruptible sleep, optional Prometheus metrics endpoint; or plain cron
-- **Run tracking** — every crawl recorded in `runs` (items/changes/drops/status); `status` doubles as a Docker healthcheck
+- **High availability** — multi-replica `watch`: replicas elect a leader through a database lease (`--lease-seconds`); standbys idle and take over automatically when the leader stops renewing (crash-safe, verified with a hard-kill failover test)
+- **Run tracking** — every crawl recorded in `runs` (items/changes/drops/status); `status` doubles as a Docker healthcheck; also shows the current watch lease
 - **Ops-ready** — Docker image (Playwright base), compose with Postgres, `.env` config (pydantic-settings), structured logs (structlog), Prometheus metrics, `prune` for retention, CI (ruff + pytest 3.12/3.13 + Postgres job + image smoke test)
 - **Crash-safe batches** — unparseable items are dropped with a warning, never abort the crawl
 
@@ -335,6 +345,7 @@ Module paths below are relative to `pricetracker/`.
 | `settings.py` | Scrapy settings derived from config (throttle, proxy, Playwright) |
 | `log.py` / `metrics.py` | structlog setup / Prometheus counters |
 | `report.py` | CSV/Excel exports, console report |
+| `loadgen.py` | Synthetic books.toscrape-compatible catalog server for load tests |
 | `demo_shop.py` | Local JS-rendered catalog (`demo-shop` command) |
 | `cli.py` | `crawl` / `report` / `export` / `watch` / `status` / `prune` / `migrate` / `retry-alerts` / `init-db` / `demo-shop` |
 
@@ -354,9 +365,10 @@ runs(id, spider, status, started_at, finished_at, items, changes, drops, message
 
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q                    # 95 passed (2 skipped: pg)
+.venv/bin/python -m pytest -q                    # 103 passed (3 skipped: pg)
+.venv/bin/python -m pytest -q -m load -s         # throughput benchmarks (also a CI job)
 PRICETRACKER_TEST_PG_URL=postgresql+psycopg://pt:pw@127.0.0.1:55432/pricetracker \
-  .venv/bin/python -m pytest -q -m pg            # Postgres roundtrip + migrations (docker run postgres:17-alpine)
+  .venv/bin/python -m pytest -q -m pg            # Postgres roundtrip + migrations + lease (docker run postgres:17-alpine)
 .venv/bin/ruff check pricetracker tests
 ```
 
@@ -365,12 +377,23 @@ from a real browser render), covers pagination limits, price/rating parsing edge
 cases, DB upsert + history semantics (SQLite + Postgres), run tracking, Alembic
 migrations, alert delivery (local webhook receiver: retries, Slack shape,
 cooldown, outbox retry backoff, dead-letter), config validation incl. legacy env
-aliases, the watch lock, prune retention, the demo shop API (incl. the login
-gate: redirects without a cookie, 401 on bad credentials, session grants catalog
-access), credential resolution for the login spider, and export/report
-contents. Two integration tests launch Chromium end-to-end against the demo
-shop (plain JS and login-gated); they skip automatically when Chromium is not
-installed.
+aliases, the watch lock, watch lease semantics (acquire/steal/renew/release),
+prune retention, the demo shop API (incl. the login gate: redirects without a
+cookie, 401 on bad credentials, session grants catalog access), credential
+resolution for the login spider, and export/report contents. Two integration
+tests launch Chromium end-to-end against the demo shop (plain JS and
+login-gated); they skip automatically when Chromium is not installed.
+
+**Measured throughput** (local machine, SQLite, `tests/test_load.py`,
+synthetic 1000-item / 50-page catalog served by `pricetracker.loadgen`):
+
+| Benchmark | Result |
+|---|---|
+| SQLite ingest (upsert + change detection) | ~5,000 inserts/s |
+| End-to-end crawl (50 pages, 1,000 items) | ~1.6s wall clock (~600 items/s incl. startup) |
+
+Tune with `PRICETRACKER_CONCURRENT_REQUESTS_PER_DOMAIN`, `PRICETRACKER_DOWNLOAD_DELAY`
+and `PRICETRACKER_AUTOTHROTTLE_TARGET` — keep politeness limits set for real sites.
 
 </details>
 

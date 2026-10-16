@@ -14,6 +14,10 @@ LAST_SUCCESS = Gauge(
     "pricetracker_last_success_timestamp_seconds",
     "Unix time of the last successful crawl",
 )
+LEASE = Gauge(
+    "pricetracker_lease_held",
+    "1 when this instance currently leads the watch lease, 0 when standing by",
+)
 
 
 def start(port: int) -> None:

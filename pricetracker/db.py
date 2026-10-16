@@ -24,6 +24,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import IntegrityError
 
 metadata = MetaData()
 
@@ -94,6 +95,15 @@ runs = Table(
     Column("message", Text),
 )
 Index("idx_runs_started", runs.c.started_at)
+
+locks = Table(
+    "locks",
+    metadata,
+    Column("name", String(128), primary_key=True),
+    Column("owner", String(256), nullable=False),
+    Column("expires_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
 
 PRICE_EPSILON = 0.0001
 
@@ -379,6 +389,78 @@ def alert_counts(conn: Connection) -> dict[str, int]:
         select(alerts.c.status, func.count()).group_by(alerts.c.status)
     ).all()
     return {status: count for status, count in rows}
+
+
+WATCH_LEASE = "watch"
+
+
+def _lease_deadline(ttl_seconds: float) -> tuple[str, str]:
+    now = datetime.now(UTC)
+    now_iso_value = now.isoformat(timespec="seconds")
+    deadline = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
+    return now_iso_value, deadline
+
+
+def acquire_lease(conn: Connection, name: str, owner: str, ttl_seconds: float) -> bool:
+    """Take or steal an expired lease. Atomic on Postgres and SQLite.
+
+    Stealing is a single conditional UPDATE, so two contenders racing on an
+    expired lease cannot both win: the loser sees the refreshed deadline.
+    """
+    now, deadline = _lease_deadline(ttl_seconds)
+    try:
+        conn.execute(
+            insert(locks).values(
+                name=name, owner=owner, expires_at=deadline, updated_at=now
+            )
+        )
+        conn.commit()
+        return True
+    except IntegrityError:
+        conn.rollback()
+
+    result = conn.execute(
+        update(locks)
+        .where(
+            locks.c.name == name,
+            (locks.c.owner == owner) | (locks.c.expires_at < now),
+        )
+        .values(owner=owner, expires_at=deadline, updated_at=now)
+    )
+    conn.commit()
+    return result.rowcount > 0
+
+
+def renew_lease(conn: Connection, name: str, owner: str, ttl_seconds: float) -> bool:
+    """Extend an owned lease. Returns False if the lease was lost meanwhile."""
+    now, deadline = _lease_deadline(ttl_seconds)
+    result = conn.execute(
+        update(locks)
+        .where(locks.c.name == name, locks.c.owner == owner)
+        .values(expires_at=deadline, updated_at=now)
+    )
+    conn.commit()
+    return result.rowcount > 0
+
+
+def release_lease(conn: Connection, name: str, owner: str) -> bool:
+    result = conn.execute(
+        delete(locks).where(locks.c.name == name, locks.c.owner == owner)
+    )
+    conn.commit()
+    return result.rowcount > 0
+
+
+def fetch_lease(conn: Connection, name: str):
+    row = conn.execute(select(locks).where(locks.c.name == name)).fetchone()
+    return row._mapping if row else None
+
+
+def expire_lease(conn: Connection, name: str) -> None:
+    """Force a lease into the past (admin escape hatch, used by tests)."""
+    past = (datetime.now(UTC) - timedelta(seconds=1)).isoformat(timespec="seconds")
+    conn.execute(update(locks).where(locks.c.name == name).values(expires_at=past))
+    conn.commit()
 
 
 ALERT_COOLDOWN_STATUSES = ("sent", "failed")
